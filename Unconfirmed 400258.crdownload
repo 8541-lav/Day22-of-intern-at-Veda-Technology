@@ -1,0 +1,85 @@
+"""Task 22 - Cohort Retention Basics (Online Retail II)"""
+import pandas as pd, numpy as np, sqlite3
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+SRC = "/mnt/user-data/uploads/online_retail_II.xlsx"
+sheets = pd.read_excel(SRC, sheet_name=None)
+raw = pd.concat(sheets.values(), ignore_index=True)
+n_raw = len(raw)
+raw = raw.drop_duplicates()            # sheets overlap on Dec 2010
+n_dedup = len(raw)
+df = raw.dropna(subset=["Customer ID"]).copy()
+n_cust_rows = len(df)
+df["Invoice"] = df["Invoice"].astype(str)
+df = df[~df["Invoice"].str.startswith("C")]     # drop cancellations
+df = df[(df["Quantity"] > 0) & (df["Price"] > 0)]
+df["CustomerID"] = df["Customer ID"].astype(int)
+df["Revenue"] = df["Quantity"] * df["Price"]
+n_clean = len(df)
+
+# ---- cohort definition: month of first purchase ----
+df["OrderMonth"] = df["InvoiceDate"].dt.to_period("M")
+df["CohortMonth"] = df.groupby("CustomerID")["OrderMonth"].transform("min")
+df["Period"] = (df["OrderMonth"].dt.year - df["CohortMonth"].dt.year) * 12 + \
+               (df["OrderMonth"].dt.month - df["CohortMonth"].dt.month)
+
+active = df.groupby(["CohortMonth", "Period"])["CustomerID"].nunique().unstack()
+sizes = active[0]
+retention = active.div(sizes, axis=0) * 100
+
+active.to_csv("cohort_active_customers.csv")
+retention.round(1).to_csv("cohort_retention_pct.csv")
+
+# ---- heatmap ----
+r = retention.copy(); r.index = r.index.astype(str)
+fig, ax = plt.subplots(figsize=(17, 10))
+annot = r.map(lambda v: "" if pd.isna(v) else f"{v:.0f}")
+sns.heatmap(r, annot=annot, fmt="", cmap="YlGnBu", vmin=0, vmax=60,
+            linewidths=.5, linecolor="white", cbar_kws={"label": "Retention (%)"}, ax=ax)
+ax.set_title("Monthly Cohort Retention (% of cohort active, by months since first purchase)", fontsize=14, pad=14)
+ax.set_xlabel("Months since first purchase"); ax.set_ylabel("Signup (first-purchase) cohort")
+plt.tight_layout(); plt.savefig("cohort_retention_heatmap.png", dpi=150); plt.close()
+
+# ---- average retention curve ----
+avg = retention.drop(columns=0).mean()
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(avg.index, avg.values, marker="o", color="#1b2a6b")
+ax.set_title("Average retention by month since first purchase"); ax.set_xlabel("Months since first purchase")
+ax.set_ylabel("Avg. retention (%)"); ax.grid(alpha=.3); plt.tight_layout()
+plt.savefig("avg_retention_curve.png", dpi=150); plt.close()
+
+# ---- stats for report ----
+stats = dict(n_raw=n_raw, n_dedup=n_dedup, n_cust_rows=n_cust_rows, n_clean=n_clean,
+             customers=df.CustomerID.nunique(), start=df.InvoiceDate.min(), end=df.InvoiceDate.max())
+print(stats)
+print("cohort sizes\n", sizes.astype(int).to_string())
+print("avg retention\n", avg.round(1).to_string())
+for p in [1,2,3,6,12]:
+    print("period",p,"mean",round(retention[p].mean(),1),"median",round(retention[p].median(),1))
+print(retention.round(1).to_string())
+# first-year vs later cohorts
+print("Dec09 cohort", retention.iloc[0].round(1).tolist())
+print("M1 by cohort", retention[1].round(1).to_dict())
+# revenue share of repeat
+first = df.groupby("CustomerID")["OrderMonth"].min()
+inv = df.groupby("CustomerID")["Invoice"].nunique()
+print("repeat customers %", round((inv>1).mean()*100,1))
+rev_by_cohort = df.groupby("CohortMonth")["Revenue"].sum()
+print("revenue by cohort", rev_by_cohort.round(0).to_dict())
+dec = df[df.CohortMonth==pd.Period("2009-12")]
+print("Dec09 cohort revenue share", round(dec.Revenue.sum()/df.Revenue.sum()*100,1))
+nov = df[df.CohortMonth>=pd.Period("2011-12")]
+# month-by-month new customers
+df[["Invoice","CustomerID","InvoiceDate","Quantity","Price"]].assign(
+    InvoiceDate=df.InvoiceDate.dt.strftime("%Y-%m-%d %H:%M:%S")).drop_duplicates().to_csv("clean_transactions.csv", index=False)
+
+# ---- SQL version (SQLite) and cross-check ----
+con = sqlite3.connect(":memory:")
+pd.read_csv("clean_transactions.csv").to_sql("transactions", con, index=False)
+sql = open("cohort_retention.sql").read()
+q = pd.read_sql(sql, con)
+piv = q.pivot(index="cohort_month", columns="period", values="active_customers")
+chk = (piv.values[~np.isnan(piv.values)] == active.values[~np.isnan(active.values)]).all() if piv.shape==active.shape else False
+print("SQL matches Python:", chk, piv.shape, active.shape)
